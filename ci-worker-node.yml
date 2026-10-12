@@ -1,0 +1,661 @@
+# =============================================================================
+# CI Worker Node — encrypted state: restore -> work -> backup x3 -> verify
+#
+#  restore : fetches every available copy (repo / release / artifact), checks
+#            each one against its own manifest, cross-compares the copies,
+#            prints a hash table, then extracts the newest verified copy.
+#  backup  : packs /home/runner/work + /home/<worker>, encrypts ONCE, and
+#            publishes the identical bytes to three places:
+#              1. backup repo  <owner>/<BACKUP_REPO>@main  (chunks + manifests)
+#              2. release      state-<worker>-<UTC>        (3 newest kept)
+#              3. artifact     state-<worker>              (7 days)
+#  verify  : the verify-backup job re-downloads all three copies, compares
+#            their ciphertext sha256 against the hash the backup staged,
+#            decrypts each copy and compares the decrypted hashes too, and
+#            prints a diff table. Any difference fails the run.
+#
+#  Crypto: every encrypt/decrypt call uses the explicit parameters in
+#    OPENSSL_KDF (never openssl's defaults — the enc default digest changed
+#    over time, MD5 -> SHA256 in OpenSSL 1.1.0, and "-sha256" is not a valid
+#    option; the correct form is -md sha256). Restore additionally falls back
+#    to the historical defaults so old backups still decrypt.
+#
+#  Secrets:
+#    TAILSCALE_AUTHKEY : tailscale auth key
+#    BACKUP_PAT        : PAT with Contents: read/write on the backup repo
+#    BACKUP_REPO       : backup repo name, e.g. "state-backup" (or "owner/name")
+#    ENCRYPTION_PASS   : openssl passphrase — never change it, old backups are
+#                        encrypted with it
+#
+#  Limits: GitHub hard-caps a job at 360 min, so keep sleep_seconds <= 19800
+#    (5.5 h) to leave room for packing + publishing. Release assets are capped
+#    at 2 GiB each and git files at 100 MB, so the blob is chunked at 45 MiB.
+#    Run one worker at a time: the repo copy is a single shared main branch.
+# =============================================================================
+name: CI Worker Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_id:
+        description: 'Worker ID (lowercase letters/digits/underscore/dash)'
+        required: true
+        default: 'generic-worker'
+      sleep_seconds:
+        description: 'Seconds to keep the worker alive before the backup (max 19800)'
+        required: true
+        default: '18000'
+      restore_source:
+        description: 'Restore from: auto (all copies, newest verified wins) or one source'
+        required: true
+        type: choice
+        options: [auto, repo, release, artifact, none]
+        default: auto
+      verify_backup:
+        description: 'After the backup, re-download all 3 copies and compare hashes'
+        required: true
+        type: boolean
+        default: true
+
+# two runs for the same worker would race on restore and overwrite each
+# other's backup, so queue them instead of running them in parallel
+concurrency:
+  group: ci-worker-${{ github.event.inputs.worker_id }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read        # list/download artifacts of previous runs
+  contents: read
+
+env:
+  # pinned PBKDF2 parameters used by every encrypt/decrypt call
+  OPENSSL_KDF: "-md sha256 -iter 200000"
+
+jobs:
+
+  # ==========================================================================
+  # 1. the worker: restore state -> run payload -> publish encrypted backup
+  # ==========================================================================
+  processor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355        # hard cap is 360; leave room for the backup
+    outputs:
+      staged: ${{ steps.finalize.outputs.staged }}
+      sha256: ${{ steps.finalize.outputs.sha256 }}
+    steps:
+
+      # ----------------------------------------------------------------------
+      - name: Validate inputs and secrets
+        env:
+          TARGET_USER:   ${{ github.event.inputs.worker_id }}
+          SLEEP_SECONDS: ${{ github.event.inputs.sleep_seconds }}
+          V_PAT:  ${{ secrets.BACKUP_PAT }}
+          V_REPO: ${{ secrets.BACKUP_REPO }}
+          V_ENC:  ${{ secrets.ENCRYPTION_PASS }}
+          V_TS:   ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] \
+            || { echo "::error::worker_id must match ^[a-z_][a-z0-9_-]{0,30}$"; exit 1; }
+          [ "$TARGET_USER" != "runner" ] \
+            || { echo "::error::worker_id 'runner' is reserved"; exit 1; }
+          [[ "$SLEEP_SECONDS" =~ ^[0-9]+$ ]] \
+            || { echo "::error::sleep_seconds must be an integer"; exit 1; }
+          [ "$SLEEP_SECONDS" -le 19800 ] \
+            || { echo "::error::sleep_seconds must be <= 19800 so the backup still fits before the 360 min job cap"; exit 1; }
+          for v in V_PAT V_REPO V_ENC V_TS; do
+            [ -n "${!v}" ] || { echo "::error::missing secret ${v#V_}"; exit 1; }
+          done
+
+      # ----------------------------------------------------------------------
+      - name: Initialize network (tailscale)
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: ${{ github.event.inputs.worker_id }}
+          tags: tag:ci
+          args: --ssh
+
+      # ----------------------------------------------------------------------
+      # restore: fetch all copies, verify each, cross-compare, extract newest
+      # ----------------------------------------------------------------------
+      - name: Restore environment state
+        if: ${{ github.event.inputs.restore_source != 'none' }}
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          RUN_TOKEN: ${{ github.token }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+          BACKUP_OWNER: ${{ github.repository_owner }}
+          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
+          WORKFLOW_REPO: ${{ github.repository }}
+          RESTORE_SOURCE: ${{ github.event.inputs.restore_source }}
+        run: |
+          set -euo pipefail
+          die()  { echo "::error::$*"; exit 1; }
+          warn() { echo "::warning::$*"; }
+
+          # BACKUP_REPO may be "name" or "owner/name"; trim stray whitespace
+          BACKUP_REPO=$(printf '%s' "$BACKUP_REPO" | tr -d '[:space:]')
+          case "$BACKUP_REPO" in
+            */*) BACKUP_OWNER="${BACKUP_REPO%%/*}"; BACKUP_REPO="${BACKUP_REPO##*/}" ;;
+          esac
+          [ -n "$BACKUP_REPO" ] || die "BACKUP_REPO is empty"
+
+          BASE=/tmp/state-fetch
+          rm -rf "$BASE"; mkdir -p "$BASE"
+
+          # rebuild <out>/state.tar.gz.enc from the state_part_* chunks found
+          # under <raw>, copying the state.sha256 / state.meta manifests along
+          stage() {
+            local raw="$1" out="$2" m found
+            mkdir -p "$out"
+            find "$raw" -type f -name 'state_part_*' 2>/dev/null \
+              | LC_ALL=C sort | tr '\n' '\0' | xargs -0 cat > "$out/state.tar.gz.enc" || true
+            [ -s "$out/state.tar.gz.enc" ] || return 1
+            for m in state.sha256 state.meta; do
+              found=$(find "$raw" -type f -name "$m" -print -quit 2>/dev/null || true)
+              if [ -n "$found" ]; then cp -f "$found" "$out/"; fi
+            done
+          }
+
+          # ---- copy 1/3: backup repo (branch main) --------------------------
+          fetch_repo() {
+            rm -rf "$BASE/repo"
+            git clone --quiet --depth 1 --branch main \
+              "https://x-access-token:${GH_TOKEN}@github.com/${BACKUP_OWNER}/${BACKUP_REPO}.git" \
+              "$BASE/repo" 2>/dev/null || return 1
+            stage "$BASE/repo/chunks" "$BASE/repo-out"
+          }
+
+          # ---- copy 2/3: newest release of this worker ----------------------
+          fetch_release() {
+            local tag
+            tag=$(gh release list -R "${BACKUP_OWNER}/${BACKUP_REPO}" -L 100 \
+                  --json tagName,createdAt \
+                  --jq "[.[]|select(.tagName|test(\"^state-${TARGET_USER}-[0-9]{8}T[0-9]{6}Z$\"))]|sort_by(.createdAt)|reverse|.[0].tagName // empty" \
+                  2>/dev/null || true)
+            [ -n "$tag" ] || return 1
+            rm -rf "$BASE/release"; mkdir -p "$BASE/release"
+            gh release download "$tag" -R "${BACKUP_OWNER}/${BACKUP_REPO}" \
+              -p 'state_part_*' -D "$BASE/release" --clobber >/dev/null 2>&1 || return 1
+            gh release download "$tag" -R "${BACKUP_OWNER}/${BACKUP_REPO}" \
+              -p 'state.sha256' -D "$BASE/release" --clobber >/dev/null 2>&1 || true
+            gh release download "$tag" -R "${BACKUP_OWNER}/${BACKUP_REPO}" \
+              -p 'state.meta' -D "$BASE/release" --clobber >/dev/null 2>&1 || true
+            stage "$BASE/release" "$BASE/release-out"
+          }
+
+          # ---- copy 3/3: newest non-expired artifact of this repo -----------
+          fetch_artifact() {
+            local id
+            id=$(GH_TOKEN="$RUN_TOKEN" gh api \
+                 "repos/${WORKFLOW_REPO}/actions/artifacts?name=state-${TARGET_USER}&per_page=100" \
+                 --jq '[.artifacts[]|select(.expired==false)]|sort_by(.created_at)|reverse|.[0].id // empty' \
+                 2>/dev/null || true)
+            [ -n "$id" ] || return 1
+            rm -rf "$BASE/artifact" "$BASE/artifact.zip"; mkdir -p "$BASE/artifact"
+            GH_TOKEN="$RUN_TOKEN" gh api \
+              "repos/${WORKFLOW_REPO}/actions/artifacts/${id}/zip" > "$BASE/artifact.zip" 2>/dev/null || return 1
+            unzip -q -o "$BASE/artifact.zip" -d "$BASE/artifact" || return 1
+            stage "$BASE/artifact" "$BASE/artifact-out"
+          }
+
+          # ---- fetch what was asked for; record hash / timestamp / status ---
+          # status: 2 = matches its own manifest, 0 = legacy (no manifest),
+          #        -1 = manifest mismatch
+          srcs=(); declare -A HASH TS OK URL
+          for s in repo release artifact; do
+            [ "$RESTORE_SOURCE" = auto ] || [ "$RESTORE_SOURCE" = "$s" ] || continue
+            if "fetch_$s"; then
+              HASH[$s]=$(sha256sum "$BASE/$s-out/state.tar.gz.enc" | awk '{print $1}')
+              TS[$s]=$(sed -n 's/^timestamp=//p' "$BASE/$s-out/state.meta" 2>/dev/null | head -n1 || true)
+              URL[$s]=$(sed -n 's/^run_url=//p' "$BASE/$s-out/state.meta" 2>/dev/null | head -n1 || true)
+              if [ -f "$BASE/$s-out/state.sha256" ]; then
+                if (cd "$BASE/$s-out" && sha256sum -c state.sha256 >/dev/null 2>&1); then
+                  OK[$s]=2
+                else
+                  OK[$s]=-1
+                  warn "$s: content does not match its own manifest (sha256 ${HASH[$s]})"
+                fi
+              else
+                OK[$s]=0
+                warn "$s: legacy backup without manifest — cannot verify"
+              fi
+              srcs+=("$s")
+              echo "$s: found  sha256=${HASH[$s]}  ts=${TS[$s]:-unknown}"
+            else
+              echo "$s: no data found"
+            fi
+          done
+
+          # ---- nothing found: fresh start, but only if that is plausible ----
+          if [ "${#srcs[@]}" -eq 0 ]; then
+            [ "$RESTORE_SOURCE" = auto ] \
+              || die "restore_source=$RESTORE_SOURCE: no data found for worker '$TARGET_USER'"
+            # never silently start fresh while the repo has a main branch:
+            # a broken PAT or wrong repo name would let the backup overwrite
+            # good copies with an empty state
+            MAIN_REF=$(git ls-remote \
+              "https://x-access-token:${GH_TOKEN}@github.com/${BACKUP_OWNER}/${BACKUP_REPO}.git" \
+              refs/heads/main 2>/dev/null | head -n1 || true)
+            [ -z "$MAIN_REF" ] \
+              || die "backup repo has a main branch but nothing could be fetched (check BACKUP_PAT / BACKUP_REPO)"
+            echo "::notice::no previous state found — starting fresh"
+            exit 0
+          fi
+
+          # ---- choose the copy to restore -----------------------------------
+          sel=""
+          if [ "$RESTORE_SOURCE" != auto ]; then
+            sel="$RESTORE_SOURCE"
+            case "${OK[$sel]:-0}" in
+              2) ;;
+              0) warn "restore_source=$sel has no manifest (legacy backup) — proceeding unverified" ;;
+              *) die "restore_source=$sel failed hash verification — refusing to extract" ;;
+            esac
+          else
+            for s in "${srcs[@]}"; do           # newest verified copy wins
+              [ "${OK[$s]}" = 2 ] || continue
+              if [ -z "$sel" ] || [[ "${TS[$s]:-}" > "${TS[$sel]:-}" ]]; then sel="$s"; fi
+            done
+            if [ -z "$sel" ]; then             # fall back to newest legacy copy
+              for s in "${srcs[@]}"; do
+                [ "${OK[$s]}" = 0 ] || continue
+                if [ -z "$sel" ] || [[ "${TS[$s]:-}" > "${TS[$sel]:-}" ]]; then sel="$s"; fi
+              done
+              [ -n "$sel" ] && warn "using '$sel' without integrity verification (legacy backup)"
+            fi
+            [ -n "$sel" ] || die "no copy passed verification — refusing to extract (sources: ${srcs[*]})"
+          fi
+
+          # ---- cross-compare the copies -------------------------------------
+          if [ "${#srcs[@]}" -gt 1 ]; then
+            for a in "${srcs[@]}"; do
+              for b in "${srcs[@]}"; do
+                if [ "$a" != "$b" ] \
+                   && [ -n "${TS[$a]:-}" ] && [ "${TS[$a]:-}" = "${TS[$b]:-}" ] \
+                   && [ "${HASH[$a]}" != "${HASH[$b]}" ]; then
+                  die "copies '$a' and '$b' share timestamp ${TS[$a]} but differ — corrupted history, refusing to extract"
+                fi
+              done
+            done
+            distinct=$(for s in "${srcs[@]}"; do echo "${HASH[$s]}"; done | sort -u | wc -l)
+            [ "$distinct" -le 1 ] \
+              || warn "the ${#srcs[@]} copies are NOT identical — stale or partially published backup; using newest verified '$sel'"
+          fi
+
+          # ---- report -------------------------------------------------------
+          {
+            echo "### State restore (worker: $TARGET_USER)"
+            echo ""
+            echo "| copy | integrity | sha256 | timestamp |"
+            echo "|---|---|---|---|"
+            for s in "${srcs[@]}"; do
+              case "${OK[$s]}" in
+                2) st="verified" ;;
+                0) st="unverified (no manifest)" ;;
+                *) st="MANIFEST MISMATCH" ;;
+              esac
+              echo "| $s | $st | \`${HASH[$s]}\` | ${TS[$s]:-unknown} |"
+            done
+            echo ""
+            echo "selected: **$sel** (${URL[$sel]:-no run url})"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          # ---- decrypt + extract --------------------------------------------
+          echo "::notice::extracting state from '$sel' (sha256 ${HASH[$sel]})"
+          # pinned parameters first, then the historical openssl defaults the
+          # old workflow used. Decrypt fully BEFORE extracting so a wrong
+          # passphrase cannot leave a half-extracted state behind.
+          tmp="$BASE/extract.tar.gz"
+          restored=0
+          for kdf in "$OPENSSL_KDF" "-md sha256 -iter 10000" "" "-md md5 -iter 10000"; do
+            rm -f "$tmp"
+            if openssl enc -d -aes-256-cbc -pbkdf2 $kdf -pass env:ENC_PASS \
+                 -in "$BASE/$sel-out/state.tar.gz.enc" -out "$tmp" 2>/dev/null \
+               && tar -tzf "$tmp" >/dev/null 2>&1; then
+              sudo tar -xzPf "$tmp" -C / || die "extraction failed"
+              restored=1
+              break
+            fi
+          done
+          rm -f "$tmp"
+          [ "$restored" = 1 ] \
+            || die "decrypt failed from '$sel' (wrong ENCRYPTION_PASS, or unknown legacy crypto parameters)"
+          rm -rf "$BASE"      # free the fetched copies before the workload runs
+          echo "::notice::state restored from '$sel'"
+
+      # ----------------------------------------------------------------------
+      - name: Process workload
+        id: workload
+        env:
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+          SLEEP_SECONDS: ${{ github.event.inputs.sleep_seconds }}
+        run: |
+          set -euo pipefail
+          TARGET_HOME="/home/$TARGET_USER"
+
+          if ! id "$TARGET_USER" >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash "$TARGET_USER"
+          fi
+          sudo usermod -aG sudo "$TARGET_USER"
+
+          echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/99-$TARGET_USER" >/dev/null
+          sudo chmod 0440 "/etc/sudoers.d/99-$TARGET_USER"
+
+          # restored files may still carry the previous run's uid — fix ownership
+          if [ -d "$TARGET_HOME" ]; then
+            sudo chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME"
+          fi
+
+          # run the payload in the background; its log lives in the home, so it
+          # gets backed up and stays debuggable
+          if [ -f "$TARGET_HOME/.cloud_init" ]; then
+            sudo -u "$TARGET_USER" bash -c \
+              "nohup bash '$TARGET_HOME/.cloud_init' >> '$TARGET_HOME/.cloud_init.log' 2>&1 &"
+          fi
+
+          echo "worker is up — sleeping ${SLEEP_SECONDS}s"
+          sleep "$SLEEP_SECONDS"
+
+      # ----------------------------------------------------------------------
+      # backup: pack + encrypt, publish copy 1/3 (repo) and copy 2/3 (release)
+      # ----------------------------------------------------------------------
+      - name: Finalize environment state
+        id: finalize
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+          BACKUP_OWNER: ${{ github.repository_owner }}
+          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
+          WORKLOAD_OUTCOME: ${{ steps.workload.outcome }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error::$*"; exit 1; }
+
+          BACKUP_REPO=$(printf '%s' "$BACKUP_REPO" | tr -d '[:space:]')
+          case "$BACKUP_REPO" in
+            */*) BACKUP_OWNER="${BACKUP_REPO%%/*}"; BACKUP_REPO="${BACKUP_REPO##*/}" ;;
+          esac
+
+          # if anything before the workload failed, it never ran — publishing
+          # now would overwrite good backups with an empty state
+          if [ "${WORKLOAD_OUTCOME:-}" = skipped ]; then
+            echo "::warning::workload did not run (an earlier step failed) — skipping backup to protect existing copies"
+            exit 0
+          fi
+
+          # stage under RUNNER_TEMP (/home/runner/work/_temp), which is
+          # excluded from the archive below, so the archive can never swallow
+          # its own ciphertext
+          STAGE="$RUNNER_TEMP/state-staging"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/chunks"
+
+          echo "stopping worker processes (SIGINT)..."
+          sudo pkill -SIGINT -u "$TARGET_USER" 2>/dev/null || true
+          sleep 10
+          sudo sync
+
+          PATHS=(/home/runner/work)
+          [ -d "/home/$TARGET_USER" ] && PATHS+=("/home/$TARGET_USER")
+
+          COMPRESS=gzip
+          command -v pigz >/dev/null 2>&1 && COMPRESS=pigz
+
+          echo "packing + encrypting (compressor: ${COMPRESS})..."
+          set +e
+          sudo tar -cP \
+            --use-compress-program="${COMPRESS} -1" \
+            --warning=no-file-changed \
+            --ignore-failed-read \
+            --exclude='*/state-repo' --exclude='*/state-repo/*' \
+            --exclude='*/state-fetch' --exclude='*/state-fetch/*' \
+            --exclude='*/state-staging' --exclude='*/state-staging/*' \
+            --exclude='*/state.tar.gz.enc' \
+            --exclude='*/_actions' --exclude='*/_actions/*' \
+            --exclude='*/_temp' --exclude='*/_temp/*' \
+            -f - "${PATHS[@]}" 2>"$STAGE/tar.err" \
+            | openssl enc -aes-256-cbc -pbkdf2 $OPENSSL_KDF -salt -pass env:ENC_PASS -out "$STAGE/state.tar.gz.enc"
+          sts=("${PIPESTATUS[@]}")
+          set -e
+          [ "${sts[0]}" -le 1 ] || { echo "::error::tar failed (exit ${sts[0]})"; tail -n 30 "$STAGE/tar.err"; exit 1; }
+          [ "${sts[1]}" -eq 0 ] || die "openssl failed (exit ${sts[1]})"
+          [ -s "$STAGE/state.tar.gz.enc" ] || die "backup is empty"
+          [ ! -s "$STAGE/tar.err" ] || { echo "tar warnings:"; tail -n 20 "$STAGE/tar.err"; }
+
+          cd "$STAGE"
+          sha256sum state.tar.gz.enc > chunks/state.sha256
+          HASH=$(awk '{print $1}' chunks/state.sha256)
+          SIZE=$(stat -c%s state.tar.gz.enc)
+          split -b 45M -d -a 3 state.tar.gz.enc chunks/state_part_
+          CHUNKS=$(find chunks -type f -name 'state_part_*' | wc -l)
+          {
+            echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "worker=$TARGET_USER"
+            echo "sha256=$HASH"
+            echo "size=$SIZE"
+            echo "chunks=$CHUNKS"
+            echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > chunks/state.meta
+
+          echo "staged=1" >> "$GITHUB_OUTPUT"
+          echo "sha256=$HASH" >> "$GITHUB_OUTPUT"
+          echo "::notice::staged $CHUNKS chunks, $SIZE bytes, sha256 $HASH"
+
+          fail=0
+          TAG="state-${TARGET_USER}-$(date -u +%Y%m%dT%H%M%SZ)"
+
+          # ---- copy 1/3: backup repo (one orphan commit, force-pushed) ------
+          PUB="$STAGE/push-repo"
+          rm -rf "$PUB"; mkdir -p "$PUB/chunks"
+          cp -f chunks/state_part_* chunks/state.sha256 chunks/state.meta "$PUB/chunks/"
+          if (
+                set -e
+                cd "$PUB"
+                git init -q -b main
+                git config user.name  "github-actions[bot]"
+                git config user.email "github-actions[bot]@users.noreply.github.com"
+                git config http.postBuffer 524288000
+                git config core.compression 0
+                git add -A
+                git commit -qm "State backup ${TARGET_USER} $(date -u +%FT%TZ)"
+                git push -f "https://x-access-token:${GH_TOKEN}@github.com/${BACKUP_OWNER}/${BACKUP_REPO}.git" main
+              ); then
+            echo "copy 1/3 (repo): pushed to ${BACKUP_REPO}@main"
+          else
+            echo "::error::copy 1/3 (repo): push failed"; fail=1
+          fi
+
+          # ---- copy 2/3: release assets in the backup repo ------------------
+          if gh release create "$TAG" -R "${BACKUP_OWNER}/${BACKUP_REPO}" \
+                --title "state ${TARGET_USER} ${TAG}" \
+                --notes "Encrypted ${TARGET_USER} state, sha256 ${HASH}. run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+                --latest=false \
+                chunks/state_part_* chunks/state.sha256 chunks/state.meta >/dev/null \
+             || gh release upload "$TAG" -R "${BACKUP_OWNER}/${BACKUP_REPO}" --clobber \
+                  chunks/state_part_* chunks/state.sha256 chunks/state.meta >/dev/null; then
+            echo "copy 2/3 (release): ${TAG}"
+            # keep only the 3 newest releases for this worker
+            OLD=$(gh release list -R "${BACKUP_OWNER}/${BACKUP_REPO}" -L 100 \
+                  --json tagName,createdAt \
+                  --jq "[.[]|select(.tagName|test(\"^state-${TARGET_USER}-[0-9]{8}T[0-9]{6}Z$\"))]|sort_by(.createdAt)|reverse|.[3:]|.[].tagName" \
+                  2>/dev/null || true)
+            for t in $OLD; do
+              gh release delete "$t" -R "${BACKUP_OWNER}/${BACKUP_REPO}" -y --cleanup-tag >/dev/null 2>&1 || true
+            done
+          else
+            echo "::error::copy 2/3 (release): upload failed"; fail=1
+          fi
+
+          # copy 3/3 is the artifact upload step right after this one
+
+          {
+            echo "### Backup staged (worker: $TARGET_USER)"
+            echo ""
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| sha256 | \`$HASH\` |"
+            echo "| size | $SIZE bytes ($CHUNKS chunks) |"
+            echo "| repo | ${GITHUB_SERVER_URL}/${BACKUP_OWNER}/${BACKUP_REPO} |"
+            echo "| release | ${GITHUB_SERVER_URL}/${BACKUP_OWNER}/${BACKUP_REPO}/releases/tag/$TAG |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $fail
+
+      # ----------------------------------------------------------------------
+      - name: Upload encrypted artifact (copy 3/3)
+        if: ${{ always() && steps.finalize.outputs.staged == '1' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-${{ github.event.inputs.worker_id }}
+          path: ${{ runner.temp }}/state-staging/chunks/
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+  # ==========================================================================
+  # 2. verify: re-download all three copies and diff them
+  # ==========================================================================
+  verify-backup:
+    name: Verify backup copies
+    needs: processor
+    if: ${{ always() && github.event.inputs.verify_backup == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Download artifact (this run)
+        if: ${{ always() && needs.processor.outputs.staged == '1' }}
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: state-${{ github.event.inputs.worker_id }}
+          path: ${{ runner.temp }}/verify/artifact
+
+      - name: Compare all three copies
+        if: ${{ always() }}
+        env:
+          CANONICAL: ${{ needs.processor.outputs.sha256 }}
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+          BACKUP_OWNER: ${{ github.repository_owner }}
+          BACKUP_REPO: ${{ secrets.BACKUP_REPO }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CANONICAL:-}" ]; then
+            echo "::notice::no backup was staged (pack failed or was skipped) — nothing to verify"
+            exit 0
+          fi
+          # env is trusted only after the processor validated it; re-check
+          # because this job also runs when the processor failed early
+          [[ "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] || { echo "::error::invalid worker_id"; exit 1; }
+
+          BACKUP_REPO=$(printf '%s' "$BACKUP_REPO" | tr -d '[:space:]')
+          case "$BACKUP_REPO" in
+            */*) BACKUP_OWNER="${BACKUP_REPO%%/*}"; BACKUP_REPO="${BACKUP_REPO##*/}" ;;
+          esac
+
+          V="$RUNNER_TEMP/verify"
+          mkdir -p "$V"
+
+          # rebuild a copy from its chunks; prints the ciphertext sha256 ("" if missing)
+          recon() {
+            local label="$1" dir="$2" first
+            first=$(find "$dir" -type f -name 'state_part_*' -print -quit 2>/dev/null || true)
+            if [ -z "$first" ]; then echo ""; return 0; fi
+            find "$dir" -type f -name 'state_part_*' | LC_ALL=C sort | tr '\n' '\0' \
+              | xargs -0 cat > "$V/$label.enc"
+            sha256sum "$V/$label.enc" | awk '{print $1}'
+          }
+
+          ART=$(recon artifact "$V/artifact")
+
+          REL=""
+          TAG=$(gh release list -R "${BACKUP_OWNER}/${BACKUP_REPO}" -L 100 \
+                --json tagName,createdAt \
+                --jq "[.[]|select(.tagName|test(\"^state-${TARGET_USER}-[0-9]{8}T[0-9]{6}Z$\"))]|sort_by(.createdAt)|reverse|.[0].tagName // empty" \
+                2>/dev/null || true)
+          if [ -n "$TAG" ]; then
+            mkdir -p "$V/release"
+            gh release download "$TAG" -R "${BACKUP_OWNER}/${BACKUP_REPO}" \
+              -p 'state_part_*' -D "$V/release" --clobber >/dev/null 2>&1 || true
+            REL=$(recon release "$V/release")
+          fi
+
+          REPO=""
+          if git clone --quiet --depth 1 --branch main \
+               "https://x-access-token:${GH_TOKEN}@github.com/${BACKUP_OWNER}/${BACKUP_REPO}.git" \
+               "$V/repo" 2>/dev/null; then
+            REPO=$(recon repo "$V/repo/chunks")
+          fi
+
+          fail=0
+          check() {
+            local label="$1" h="$2"
+            if [ -z "$h" ]; then
+              echo "::error::$label: copy missing"; fail=1
+            elif [ "$h" = "$CANONICAL" ]; then
+              echo "$label: ciphertext sha256 OK"
+            else
+              echo "::error::$label: ciphertext sha256 DIFF (expected $CANONICAL, got $h)"; fail=1
+            fi
+          }
+          check repo "$REPO"
+          check release "$REL"
+          check artifact "$ART"
+
+          # decrypt every present copy and compare the decrypted payloads too
+          # (this is the "restore from all three, then diff" check); one temp
+          # file at a time to save disk
+          declare -A PLAIN
+          for s in repo release artifact; do
+            f="$V/$s.enc"
+            [ -s "$f" ] || continue
+            rm -f "$V/$s.tar.gz"
+            if openssl enc -d -aes-256-cbc -pbkdf2 $OPENSSL_KDF -pass env:ENC_PASS \
+                 -in "$f" -out "$V/$s.tar.gz" 2>/dev/null \
+               && tar -tzf "$V/$s.tar.gz" >/dev/null 2>&1; then
+              PLAIN[$s]=$(sha256sum "$V/$s.tar.gz" | awk '{print $1}')
+              echo "$s: decrypt OK (decrypted sha256 ${PLAIN[$s]})"
+            else
+              echo "::error::$s: decrypt/list test FAILED"; fail=1
+            fi
+            rm -f "$V/$s.tar.gz"
+          done
+          if [ "${#PLAIN[@]}" -gt 1 ]; then
+            n=$(printf '%s\n' "${PLAIN[@]}" | sort -u | wc -l)
+            if [ "$n" -eq 1 ]; then
+              echo "decrypted payloads: identical across all present copies"
+            else
+              echo "::error::decrypted payloads DIFFER between copies"; fail=1
+            fi
+          fi
+
+          {
+            echo "### Backup verification"
+            echo ""
+            echo "| copy | enc sha256 | dec sha256 | result |"
+            echo "|---|---|---|---|"
+            echo "| canonical (staged) | \`$CANONICAL\` | — | — |"
+            row() {
+              local l="$1" h="$2" p="${3:-}" r
+              if [ -z "$h" ]; then r="missing"; elif [ "$h" = "$CANONICAL" ]; then r="ok"; else r="DIFF"; fi
+              [ -n "$p" ] || p="—"
+              echo "| $l | \`${h:-—}\` | \`$p\` | $r |"
+            }
+            row repo "$REPO" "${PLAIN[repo]:-}"
+            row release "$REL" "${PLAIN[release]:-}"
+            row artifact "$ART" "${PLAIN[artifact]:-}"
+            echo ""
+            if [ "$fail" = 0 ]; then
+              echo "**All three copies match.**"
+            else
+              echo "**Differences found — see job log above.**"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          exit $fail
